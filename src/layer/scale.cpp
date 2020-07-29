@@ -16,13 +16,10 @@
 
 namespace ncnn {
 
-DEFINE_LAYER_CREATOR(Scale)
-
 Scale::Scale()
 {
     one_blob_only = true;
     support_inplace = true;
-    support_vulkan = true;
 }
 
 int Scale::load_param(const ParamDict& pd)
@@ -38,12 +35,12 @@ int Scale::load_param(const ParamDict& pd)
 
 int Scale::load_model(const ModelBin& mb)
 {
-    if (scale_data_size != -233)
-    {
-        scale_data = mb.load(scale_data_size, 1);
-        if (scale_data.empty())
-            return -100;
-    }
+    if (scale_data_size == -233)
+        return 0;
+
+    scale_data = mb.load(scale_data_size, 1);
+    if (scale_data.empty())
+        return -100;
 
     if (bias_term)
     {
@@ -71,7 +68,7 @@ int Scale::forward_inplace(std::vector<Mat>& bottom_top_blobs, const Option& opt
         if (bias_term)
         {
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int i=0; i<w; i++)
+            for (int i = 0; i < w; i++)
             {
                 ptr[i] = ptr[i] * scale_blob[i] + bias_data[i];
             }
@@ -79,7 +76,7 @@ int Scale::forward_inplace(std::vector<Mat>& bottom_top_blobs, const Option& opt
         else
         {
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int i=0; i<w; i++)
+            for (int i = 0; i < w; i++)
             {
                 ptr[i] *= scale_blob[i];
             }
@@ -94,13 +91,13 @@ int Scale::forward_inplace(std::vector<Mat>& bottom_top_blobs, const Option& opt
         if (bias_term)
         {
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int i=0; i<h; i++)
+            for (int i = 0; i < h; i++)
             {
                 float* ptr = bottom_top_blob.row(i);
                 float s = scale_blob[i];
                 float bias = bias_data[i];
 
-                for (int j=0; j<w; j++)
+                for (int j = 0; j < w; j++)
                 {
                     ptr[j] = ptr[j] * s + bias;
                 }
@@ -109,12 +106,12 @@ int Scale::forward_inplace(std::vector<Mat>& bottom_top_blobs, const Option& opt
         else
         {
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int i=0; i<h; i++)
+            for (int i = 0; i < h; i++)
             {
                 float* ptr = bottom_top_blob.row(i);
                 float s = scale_blob[i];
 
-                for (int j=0; j<w; j++)
+                for (int j = 0; j < w; j++)
                 {
                     ptr[j] *= s;
                 }
@@ -132,14 +129,14 @@ int Scale::forward_inplace(std::vector<Mat>& bottom_top_blobs, const Option& opt
         if (bias_term)
         {
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int q=0; q<channels; q++)
+            for (int q = 0; q < channels; q++)
             {
                 float* ptr = bottom_top_blob.channel(q);
 
                 float s = scale_blob[q];
                 float bias = bias_data[q];
 
-                for (int i=0; i<size; i++)
+                for (int i = 0; i < size; i++)
                 {
                     ptr[i] = ptr[i] * s + bias;
                 }
@@ -148,13 +145,13 @@ int Scale::forward_inplace(std::vector<Mat>& bottom_top_blobs, const Option& opt
         else
         {
             #pragma omp parallel for num_threads(opt.num_threads)
-            for (int q=0; q<channels; q++)
+            for (int q = 0; q < channels; q++)
             {
                 float* ptr = bottom_top_blob.channel(q);
 
                 float s = scale_blob[q];
 
-                for (int i=0; i<size; i++)
+                for (int i = 0; i < size; i++)
                 {
                     ptr[i] *= s;
                 }
@@ -173,74 +170,5 @@ int Scale::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
     return forward_inplace(bottom_top_blobs, opt);
 }
-
-#if NCNN_VULKAN
-int Scale::upload_model(VkTransfer& cmd)
-{
-    if (scale_data_size != -233)
-    {
-        cmd.record_upload(scale_data, scale_data_gpu);
-    }
-
-    if (bias_term)
-    {
-        cmd.record_upload(bias_data, bias_data_gpu);
-    }
-
-    return 0;
-}
-
-int Scale::create_pipeline()
-{
-    if (scale_data_size == -233)
-        pipeline->set_optimal_local_size_xyz();
-    else
-        pipeline->set_optimal_local_size_xyz(8, 8, scale_data_size);
-
-    std::vector<vk_specialization_type> specializations(1);
-    specializations[0].i = bias_term;
-
-    pipeline->create("scale", specializations, 3, 5);
-
-    return 0;
-}
-
-int Scale::forward_inplace(std::vector<VkMat>& bottom_top_blobs, VkCompute& cmd, const Option& opt) const
-{
-    VkMat& bottom_top_blob = bottom_top_blobs[0];
-    const VkMat& scale_blob = bottom_top_blobs[1];
-
-//     fprintf(stderr, "Scale::forward_inplace %p\n", bottom_top_blob.buffer());
-
-    std::vector<VkMat> bindings(3);
-    bindings[0] = bottom_top_blob;
-    bindings[1] = scale_blob;
-    bindings[2] = bias_term ? bias_data_gpu : scale_blob;// TODO use dummy buffer
-
-    std::vector<vk_constant_type> constants(5);
-    constants[0].i = bottom_top_blob.dims;
-    constants[1].i = bottom_top_blob.w;
-    constants[2].i = bottom_top_blob.h;
-    constants[3].i = bottom_top_blob.c;
-    constants[4].i = bottom_top_blob.cstep;
-
-    // record
-    cmd.record_prepare_compute_barrier(bottom_top_blob);
-    if (scale_data_size == -233)
-        cmd.record_prepare_compute_barrier(scale_blob);
-    cmd.record_pipeline(pipeline, bindings, constants, bottom_top_blob);
-
-    return 0;
-}
-
-int Scale::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, const Option& opt) const
-{
-    std::vector<VkMat> bottom_top_blobs(2);
-    bottom_top_blobs[0] = bottom_top_blob;
-    bottom_top_blobs[1] = scale_data_gpu;
-
-    return forward_inplace(bottom_top_blobs, cmd, opt);
-}
-#endif // NCNN_VULKAN
 
 } // namespace ncnn

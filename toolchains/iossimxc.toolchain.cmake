@@ -16,7 +16,7 @@ set(CMAKE_CXX_COMPILER i386-apple-darwin11-clang++)
 
 set(_CMAKE_TOOLCHAIN_PREFIX i386-apple-darwin11-)
 
-set(CMAKE_IOS_SDK_ROOT "/home/nihui/osd/cctools-port/usage_examples/ios_toolchain/target-sim/SDK/")
+set(CMAKE_IOS_SDK_ROOT "/home/nihui/osd/cctools-port/usage_examples/ios_toolchain/target-sim/SDK/iPhoneSimulator10.2.sdk")
 
 # Set the sysroot default to the most recent SDK
 set(CMAKE_OSX_SYSROOT ${CMAKE_IOS_SDK_ROOT} CACHE PATH "Sysroot used for iOS Simulator support")
@@ -26,10 +26,21 @@ set(CMAKE_OSX_SYSROOT ${CMAKE_IOS_SDK_ROOT} CACHE PATH "Sysroot used for iOS Sim
 # set(IOS_ARCH x86_64)
 set(IOS_ARCH i386;x86_64)
 
-set(CMAKE_OSX_ARCHITECTURES ${IOS_ARCH} CACHE string "Build architecture for iOS Simulator")
+set(CMAKE_OSX_ARCHITECTURES ${IOS_ARCH} CACHE STRING "Build architecture for iOS Simulator")
+
+if(NOT DEFINED ENABLE_BITCODE)
+    # enable bitcode support by default
+    set(ENABLE_BITCODE TRUE CACHE BOOL "enable bitcode")
+endif()
+
+if(ENABLE_BITCODE)
+    # enable bitcode
+    set(CMAKE_C_FLAGS "-fembed-bitcode ${CMAKE_C_FLAGS}")
+    set(CMAKE_CXX_FLAGS "-fembed-bitcode ${CMAKE_CXX_FLAGS}")
+endif()
 
 # Set the find root to the iOS developer roots and to user defined paths
-set(CMAKE_FIND_ROOT_PATH ${CMAKE_IOS_DEVELOPER_ROOT} ${CMAKE_IOS_SDK_ROOT} ${CMAKE_PREFIX_PATH} CACHE string "iOS Simulator find search path root")
+set(CMAKE_FIND_ROOT_PATH ${CMAKE_IOS_DEVELOPER_ROOT} ${CMAKE_IOS_SDK_ROOT} ${CMAKE_PREFIX_PATH} CACHE STRING "iOS Simulator find search path root")
 
 # searching for frameworks only
 set(CMAKE_FIND_FRAMEWORK FIRST)

@@ -12,13 +12,13 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-#include <stdio.h>
-#include <vector>
+#include "net.h"
+
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
-
-#include "net.h"
+#include <stdio.h>
+#include <vector>
 
 struct Object
 {
@@ -31,9 +31,12 @@ static int detect_yolov2(const cv::Mat& bgr, std::vector<Object>& objects)
 {
     ncnn::Net yolov2;
 
+    yolov2.opt.use_vulkan_compute = true;
+
     // original pretrained model from https://github.com/eric612/MobileNet-YOLO
     // https://github.com/eric612/MobileNet-YOLO/blob/master/models/yolov2/mobilenet_yolo_deploy.prototxt
     // https://github.com/eric612/MobileNet-YOLO/blob/master/models/yolov2/mobilenet_yolo_deploy_iter_80000.caffemodel
+    // the ncnn model https://github.com/nihui/ncnn-assets/tree/master/models
     yolov2.load_param("mobilenet_yolo.param");
     yolov2.load_model("mobilenet_yolo.bin");
 
@@ -59,9 +62,9 @@ static int detect_yolov2(const cv::Mat& bgr, std::vector<Object>& objects)
     ncnn::Mat out;
     ex.extract("detection_out", out);
 
-//     printf("%d %d %d\n", out.w, out.h, out.c);
+    //     printf("%d %d %d\n", out.w, out.h, out.c);
     objects.clear();
-    for (int i=0; i<out.h; i++)
+    for (int i = 0; i < out.h; i++)
     {
         const float* values = out.row(i);
 
@@ -82,11 +85,12 @@ static int detect_yolov2(const cv::Mat& bgr, std::vector<Object>& objects)
 static void draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects)
 {
     static const char* class_names[] = {"background",
-        "aeroplane", "bicycle", "bird", "boat",
-        "bottle", "bus", "car", "cat", "chair",
-        "cow", "diningtable", "dog", "horse",
-        "motorbike", "person", "pottedplant",
-        "sheep", "sofa", "train", "tvmonitor"};
+                                        "aeroplane", "bicycle", "bird", "boat",
+                                        "bottle", "bus", "car", "cat", "chair",
+                                        "cow", "diningtable", "dog", "horse",
+                                        "motorbike", "person", "pottedplant",
+                                        "sheep", "sofa", "train", "tvmonitor"
+                                       };
 
     cv::Mat image = bgr.clone();
 
@@ -112,9 +116,8 @@ static void draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects)
         if (x + label_size.width > image.cols)
             x = image.cols - label_size.width;
 
-        cv::rectangle(image, cv::Rect(cv::Point(x, y),
-                                      cv::Size(label_size.width, label_size.height + baseLine)),
-                      cv::Scalar(255, 255, 255), CV_FILLED);
+        cv::rectangle(image, cv::Rect(cv::Point(x, y), cv::Size(label_size.width, label_size.height + baseLine)),
+                      cv::Scalar(255, 255, 255), -1);
 
         cv::putText(image, text, cv::Point(x, y + label_size.height),
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
@@ -134,7 +137,7 @@ int main(int argc, char** argv)
 
     const char* imagepath = argv[1];
 
-    cv::Mat m = cv::imread(imagepath, CV_LOAD_IMAGE_COLOR);
+    cv::Mat m = cv::imread(imagepath, 1);
     if (m.empty())
     {
         fprintf(stderr, "cv::imread %s failed\n", imagepath);

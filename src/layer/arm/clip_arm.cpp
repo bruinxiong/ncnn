@@ -20,17 +20,62 @@
 
 namespace ncnn {
 
-DEFINE_LAYER_CREATOR(Clip_arm)
-
-int Clip_arm::forward_inplace(Mat &bottom_top_blob, const Option &opt) const
+Clip_arm::Clip_arm()
 {
+#if __ARM_NEON
+    support_packing = true;
+#if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+    support_fp16_storage = true;
+#endif
+#endif // __ARM_NEON
+
+    support_bf16_storage = true;
+}
+
+int Clip_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
+{
+#if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+    if (opt.use_fp16_storage)
+        return forward_inplace_fp16s(bottom_top_blob, opt);
+#endif
+
+    if (opt.use_bf16_storage)
+        return forward_inplace_bf16s(bottom_top_blob, opt);
+
     int w = bottom_top_blob.w;
     int h = bottom_top_blob.h;
     int channels = bottom_top_blob.c;
     int size = w * h;
+    int elempack = bottom_top_blob.elempack;
+
+#if __ARM_NEON
+    if (elempack == 4)
+    {
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < channels; q++)
+        {
+            float* ptr = bottom_top_blob.channel(q);
+
+            float32x4_t _max = vdupq_n_f32(max);
+            float32x4_t _min = vdupq_n_f32(min);
+
+            for (int i = 0; i < size; i++)
+            {
+                float32x4_t _ptr = vld1q_f32(ptr);
+                _ptr = vmaxq_f32(_ptr, _min);
+                _ptr = vminq_f32(_ptr, _max);
+                vst1q_f32(ptr, _ptr);
+
+                ptr += 4;
+            }
+        }
+
+        return 0;
+    }
+#endif // __ARM_NEON
 
     #pragma omp parallel for num_threads(opt.num_threads)
-    for (int q=0; q<channels; q++)
+    for (int q = 0; q < channels; q++)
     {
         float* ptr = bottom_top_blob.channel(q);
 
@@ -45,7 +90,7 @@ int Clip_arm::forward_inplace(Mat &bottom_top_blob, const Option &opt) const
         float32x4_t _max = vdupq_n_f32(max);
         float32x4_t _min = vdupq_n_f32(min);
 #if __aarch64__
-        for (; nn>0; nn--)
+        for (; nn > 0; nn--)
         {
             float32x4_t _ptr = vld1q_f32(ptr);
             _ptr = vmaxq_f32(_ptr, _min);
@@ -56,32 +101,31 @@ int Clip_arm::forward_inplace(Mat &bottom_top_blob, const Option &opt) const
 #else
         if (nn > 0)
         {
-        asm volatile(
-            "0:                             \n"
-            "pld        [%1, #128]          \n"
-            "vld1.f32   {d0-d1}, [%1: 128]  \n"
+            asm volatile(
+                "0:                             \n"
+                "pld        [%1, #128]          \n"
+                "vld1.f32   {d0-d1}, [%1: 128]  \n"
 
-            "vmax.f32   q0, q0, %q4         \n"
-            "vmin.f32   q0, q0, %q5         \n"
+                "vmax.f32   q0, q0, %q4         \n"
+                "vmin.f32   q0, q0, %q5         \n"
 
-            "subs       %0, #1              \n"
-            "vst1.f32   {d0-d1}, [%1: 128]! \n"
+                "subs       %0, #1              \n"
+                "vst1.f32   {d0-d1}, [%1: 128]! \n"
 
-            "bne        0b                  \n"
+                "bne        0b                  \n"
 
-            : "=r"(nn),     // %0
-              "=r"(ptr)     // %1
-            : "0"(nn),
-              "1"(ptr),
-              "w"(_min),    // %q4
-              "w"(_max)     // %q5
-            : "cc", "memory", "q0"
-        );
+                : "=r"(nn), // %0
+                "=r"(ptr) // %1
+                : "0"(nn),
+                "1"(ptr),
+                "w"(_min), // %q4
+                "w"(_max)  // %q5
+                : "cc", "memory", "q0");
         }
 #endif // __aarch64__
 #endif // __ARM_NEON
 
-        for (; remain>0; remain--)
+        for (; remain > 0; remain--)
         {
             if (*ptr < min)
                 *ptr = min;
@@ -89,6 +133,199 @@ int Clip_arm::forward_inplace(Mat &bottom_top_blob, const Option &opt) const
             if (*ptr > max)
                 *ptr = max;
 
+            ptr++;
+        }
+    }
+
+    return 0;
+}
+
+#if __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+int Clip_arm::forward_inplace_fp16s(Mat& bottom_top_blob, const Option& opt) const
+{
+    int w = bottom_top_blob.w;
+    int h = bottom_top_blob.h;
+    int channels = bottom_top_blob.c;
+    int size = w * h;
+    int elempack = bottom_top_blob.elempack;
+
+    if (elempack == 8)
+    {
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < channels; q++)
+        {
+            __fp16* ptr = bottom_top_blob.channel(q);
+
+            float16x8_t _max = vdupq_n_f16(max);
+            float16x8_t _min = vdupq_n_f16(min);
+
+            for (int i = 0; i < size; i++)
+            {
+                float16x8_t _ptr = vld1q_f16(ptr);
+                _ptr = vmaxq_f16(_ptr, _min);
+                _ptr = vminq_f16(_ptr, _max);
+                vst1q_f16(ptr, _ptr);
+
+                ptr += 8;
+            }
+        }
+
+        return 0;
+    }
+
+    if (elempack == 4)
+    {
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < channels; q++)
+        {
+            __fp16* ptr = bottom_top_blob.channel(q);
+
+            float16x8_t _max = vdupq_n_f16(max);
+            float16x8_t _min = vdupq_n_f16(min);
+
+            int i = 0;
+            for (; i + 1 < size; i += 2)
+            {
+                float16x8_t _ptr = vld1q_f16(ptr);
+                _ptr = vmaxq_f16(_ptr, _min);
+                _ptr = vminq_f16(_ptr, _max);
+                vst1q_f16(ptr, _ptr);
+
+                ptr += 8;
+            }
+            for (; i < size; i++)
+            {
+                float16x4_t _ptr = vld1_f16(ptr);
+                _ptr = vmax_f16(_ptr, vget_low_f16(_min));
+                _ptr = vmin_f16(_ptr, vget_low_f16(_max));
+                vst1_f16(ptr, _ptr);
+
+                ptr += 4;
+            }
+        }
+
+        return 0;
+    }
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int q = 0; q < channels; q++)
+    {
+        __fp16* ptr = bottom_top_blob.channel(q);
+
+        int i = 0;
+
+        float16x8_t _max = vdupq_n_f16(max);
+        float16x8_t _min = vdupq_n_f16(min);
+
+        for (; i + 7 < size; i += 8)
+        {
+            float16x8_t _ptr = vld1q_f16(ptr);
+            _ptr = vmaxq_f16(_ptr, _min);
+            _ptr = vminq_f16(_ptr, _max);
+            vst1q_f16(ptr, _ptr);
+
+            ptr += 8;
+        }
+        for (; i + 3 < size; i += 4)
+        {
+            float16x4_t _ptr = vld1_f16(ptr);
+            _ptr = vmax_f16(_ptr, vget_low_f16(_min));
+            _ptr = vmin_f16(_ptr, vget_low_f16(_max));
+            vst1_f16(ptr, _ptr);
+
+            ptr += 4;
+        }
+
+        __fp16 min_fp16 = min;
+        __fp16 max_fp16 = max;
+
+        for (; i < size; i++)
+        {
+            __fp16 v = *ptr;
+            if (v < min_fp16)
+                v = min_fp16;
+
+            if (v > max_fp16)
+                v = max_fp16;
+
+            *ptr = v;
+            ptr++;
+        }
+    }
+
+    return 0;
+}
+#endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+int Clip_arm::forward_inplace_bf16s(Mat& bottom_top_blob, const Option& opt) const
+{
+    int w = bottom_top_blob.w;
+    int h = bottom_top_blob.h;
+    int channels = bottom_top_blob.c;
+    int size = w * h;
+    int elempack = bottom_top_blob.elempack;
+
+#if __ARM_NEON
+    if (elempack == 4)
+    {
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < channels; q++)
+        {
+            unsigned short* ptr = bottom_top_blob.channel(q);
+
+            float32x4_t _max = vdupq_n_f32(max);
+            float32x4_t _min = vdupq_n_f32(min);
+
+            for (int i = 0; i < size; i++)
+            {
+                float32x4_t _ptr = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(ptr), 16));
+                _ptr = vmaxq_f32(_ptr, _min);
+                _ptr = vminq_f32(_ptr, _max);
+                vst1_u16(ptr, vshrn_n_u32(vreinterpretq_u32_f32(_ptr), 16));
+
+                ptr += 4;
+            }
+        }
+
+        return 0;
+    }
+#endif // __ARM_NEON
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int q = 0; q < channels; q++)
+    {
+        unsigned short* ptr = bottom_top_blob.channel(q);
+
+#if __ARM_NEON
+        int nn = size >> 2;
+        int remain = size & 3;
+#else
+        int remain = size;
+#endif
+
+#if __ARM_NEON
+        float32x4_t _max = vdupq_n_f32(max);
+        float32x4_t _min = vdupq_n_f32(min);
+        for (; nn > 0; nn--)
+        {
+            float32x4_t _ptr = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(ptr), 16));
+            _ptr = vmaxq_f32(_ptr, _min);
+            _ptr = vminq_f32(_ptr, _max);
+            vst1_u16(ptr, vshrn_n_u32(vreinterpretq_u32_f32(_ptr), 16));
+            ptr += 4;
+        }
+#endif // __ARM_NEON
+
+        for (; remain > 0; remain--)
+        {
+            float v = bfloat16_to_float32(*ptr);
+            if (v < min)
+                v = min;
+
+            if (v > max)
+                v = max;
+
+            *ptr = float32_to_bfloat16(v);
             ptr++;
         }
     }

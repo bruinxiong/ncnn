@@ -13,18 +13,15 @@
 // specific language governing permissions and limitations under the License.
 
 #include "batchnorm.h"
-#include "pipeline.h"
+
 #include <math.h>
 
 namespace ncnn {
-
-DEFINE_LAYER_CREATOR(BatchNorm)
 
 BatchNorm::BatchNorm()
 {
     one_blob_only = true;
     support_inplace = true;
-    support_vulkan = true;
 }
 
 int BatchNorm::load_param(const ParamDict& pd)
@@ -60,9 +57,9 @@ int BatchNorm::load_model(const ModelBin& mb)
     if (b_data.empty())
         return -100;
 
-    for (int i=0; i<channels; i++)
+    for (int i = 0; i < channels; i++)
     {
-        float sqrt_var = sqrt(var_data[i] + eps);
+        float sqrt_var = static_cast<float>(sqrt(var_data[i] + eps));
         a_data[i] = bias_data[i] - slope_data[i] * mean_data[i] / sqrt_var;
         b_data[i] = slope_data[i] / sqrt_var;
     }
@@ -85,7 +82,7 @@ int BatchNorm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         float* ptr = bottom_top_blob;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int i=0; i<w; i++)
+        for (int i = 0; i < w; i++)
         {
             ptr[i] = b_data[i] * ptr[i] + a_data[i];
         }
@@ -97,13 +94,13 @@ int BatchNorm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         int h = bottom_top_blob.h;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int i=0; i<h; i++)
+        for (int i = 0; i < h; i++)
         {
             float* ptr = bottom_top_blob.row(i);
             float a = a_data[i];
             float b = b_data[i];
 
-            for (int j=0; j<w; j++)
+            for (int j = 0; j < w; j++)
             {
                 ptr[j] = b * ptr[j] + a;
             }
@@ -117,13 +114,13 @@ int BatchNorm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         int size = w * h;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             float* ptr = bottom_top_blob.channel(q);
             float a = a_data[q];
             float b = b_data[q];
 
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 ptr[i] = b * ptr[i] + a;
             }
@@ -132,49 +129,5 @@ int BatchNorm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
     return 0;
 }
-
-#if NCNN_VULKAN
-int BatchNorm::upload_model(VkTransfer& cmd)
-{
-    cmd.record_upload(a_data, a_data_gpu);
-    cmd.record_upload(b_data, b_data_gpu);
-
-    return 0;
-}
-
-int BatchNorm::create_pipeline()
-{
-    pipeline->set_optimal_local_size_xyz(32, 32, channels);
-
-    std::vector<vk_specialization_type> specializations(0);
-
-    pipeline->create("batchnorm", specializations, 3, 5);
-
-    return 0;
-}
-
-int BatchNorm::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, const Option& opt) const
-{
-//     fprintf(stderr, "BatchNorm::forward_inplace %p\n", bottom_top_blob.buffer());
-
-    std::vector<VkMat> bindings(3);
-    bindings[0] = bottom_top_blob;
-    bindings[1] = a_data_gpu;
-    bindings[2] = b_data_gpu;
-
-    std::vector<vk_constant_type> constants(5);
-    constants[0].i = bottom_top_blob.dims;
-    constants[1].i = bottom_top_blob.w;
-    constants[2].i = bottom_top_blob.h;
-    constants[3].i = bottom_top_blob.c;
-    constants[4].i = bottom_top_blob.cstep;
-
-    // record
-    cmd.record_prepare_compute_barrier(bottom_top_blob);
-    cmd.record_pipeline(pipeline, bindings, constants, bottom_top_blob);
-
-    return 0;
-}
-#endif // NCNN_VULKAN
 
 } // namespace ncnn

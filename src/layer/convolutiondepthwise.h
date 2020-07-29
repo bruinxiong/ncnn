@@ -23,21 +23,19 @@ class ConvolutionDepthWise : public Layer
 {
 public:
     ConvolutionDepthWise();
-    ~ConvolutionDepthWise();
 
     virtual int load_param(const ParamDict& pd);
 
     virtual int load_model(const ModelBin& mb);
 
+    virtual int create_pipeline(const Option& opt);
+
     virtual int forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
 
-#if NCNN_VULKAN
-    virtual int upload_model(VkTransfer& cmd);
+protected:
+    void make_padding(const Mat& bottom_blob, Mat& bottom_blob_bordered, const Option& opt) const;
 
-    virtual int create_pipeline();
-
-    virtual int forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const;
-#endif // NCNN_VULKAN
+    int forward_int8(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
 
 public:
     // param
@@ -48,8 +46,11 @@ public:
     int dilation_h;
     int stride_w;
     int stride_h;
-    int pad_w;
-    int pad_h;
+    int pad_left; // -233=SAME_UPPER -234=SAME_LOWER
+    int pad_right;
+    int pad_top;
+    int pad_bottom;
+    float pad_value;
     int bias_term;
 
     int weight_data_size;
@@ -57,24 +58,19 @@ public:
 
     int int8_scale_term;
 
+    // 0=none 1=relu 2=leakyrelu 3=clip 4=sigmoid
+    int activation_type;
+    Mat activation_params;
+
     // model
     Mat weight_data;
     Mat bias_data;
 
-#if NCNN_VULKAN
-    VkMat weight_data_gpu;
-    VkMat bias_data_gpu;
-
-    ncnn::Layer* padding;
-#endif // NCNN_VULKAN
-
     Mat weight_data_int8_scales;
     Mat bottom_blob_int8_scales;
+    float top_blob_int8_scale;
 
-    bool use_int8_inference;
-
-    std::vector<ncnn::Layer*> quantize_ops;
-    std::vector<ncnn::Layer*> dequantize_ops;
+    bool use_int8_requantize;
 };
 
 } // namespace ncnn

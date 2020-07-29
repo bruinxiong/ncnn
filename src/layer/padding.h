@@ -26,21 +26,26 @@ public:
 
     virtual int load_param(const ParamDict& pd);
 
+    virtual int load_model(const ModelBin& mb);
+
     virtual int forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
 
-#if NCNN_VULKAN
-    virtual int create_pipeline();
-
-    virtual int forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const;
-#endif // NCNN_VULKAN
+    virtual int forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const;
 
 public:
+    // -233 = dynamic offset from reference blob
     int top;
     int bottom;
     int left;
     int right;
-    int type;// 0=BORDER_CONSTANT 1=BORDER_REPLICATE
+    int type; // 0=CONSTANT 1=REPLICATE 2=REFLECT
     float value;
+    int front;
+    int behind;
+
+    // per channel pad value
+    int per_channel_pad_data_size;
+    Mat per_channel_pad_data;
 };
 
 } // namespace ncnn

@@ -16,24 +16,14 @@
 
 #include "layer_type.h"
 
-namespace ncnn {
+#include <algorithm>
 
-DEFINE_LAYER_CREATOR(InnerProduct)
+namespace ncnn {
 
 InnerProduct::InnerProduct()
 {
     one_blob_only = true;
     support_inplace = false;
-    support_vulkan = true;
-
-    quantize = 0;
-    dequantize = 0;
-}
-
-InnerProduct::~InnerProduct()
-{
-    delete quantize;
-    delete dequantize;
 }
 
 int InnerProduct::load_param(const ParamDict& pd)
@@ -42,11 +32,13 @@ int InnerProduct::load_param(const ParamDict& pd)
     bias_term = pd.get(1, 0);
     weight_data_size = pd.get(2, 0);
     int8_scale_term = pd.get(8, 0);
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
 
-    use_int8_inference = pd.use_int8_inference;
-
-    if (int8_scale_term == 0)
-        use_int8_inference = false;
+    if (int8_scale_term)
+    {
+        use_int8_inference = true;
+    }
 
     return 0;
 }
@@ -66,38 +58,33 @@ int InnerProduct::load_model(const ModelBin& mb)
 
     if (int8_scale_term)
     {
-        weight_data_int8_scale = mb.load(1, 1)[0];
+        weight_data_int8_scales = mb.load(num_output, 1);
         bottom_blob_int8_scale = mb.load(1, 1)[0];
     }
 
-    bool weight_data_is_int8 = (weight_data.elemsize == (size_t)1u);
-    bool weight_data_is_float32 = (weight_data.elemsize == (size_t)4u);
+    return 0;
+}
 
-    if (weight_data_is_int8 && !use_int8_inference)
+int InnerProduct::create_pipeline(const Option& opt)
+{
+    // runtime quantize the weight data
+    if (opt.use_int8_inference && weight_data.elemsize == (size_t)4u && int8_scale_term)
     {
-        fprintf(stderr, "quantized int8 weight loaded but use_int8_inference disabled\n");
-        return -1;
-    }
-
-    if (use_int8_inference)
-    {
-        quantize = ncnn::create_layer(ncnn::LayerType::Quantize);
-        dequantize = ncnn::create_layer(ncnn::LayerType::Dequantize);
-    }
-
-    if (weight_data_is_float32 && use_int8_inference)
-    {
-        // quantize weight to int8
-        ncnn::ParamDict pd;
-        pd.set(0, weight_data_int8_scale);// scale
-
-        quantize->load_param(pd);
-
-        Mat int8_weight_data;
-        quantize->forward(weight_data, int8_weight_data);
-
+        Mat int8_weight_data(weight_data_size, (size_t)1u);
         if (int8_weight_data.empty())
             return -100;
+
+        const int weight_data_size_output = weight_data_size / num_output;
+
+        for (int p = 0; p < num_output; p++)
+        {
+            Option opt_q = opt;
+            opt_q.blob_allocator = int8_weight_data.allocator;
+
+            const Mat weight_data_n = weight_data.range(weight_data_size_output * p, weight_data_size_output);
+            Mat int8_weight_data_n = int8_weight_data.range(weight_data_size_output * p, weight_data_size_output);
+            quantize_float32_to_int8(weight_data_n, int8_weight_data_n, weight_data_int8_scales[p], opt_q);
+        }
 
         weight_data = int8_weight_data;
     }
@@ -107,6 +94,11 @@ int InnerProduct::load_model(const ModelBin& mb)
 
 int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
+    if (opt.use_int8_inference && weight_data.elemsize == (size_t)1u)
+    {
+        return forward_int8(bottom_blob, top_blob, opt);
+    }
+
     int w = bottom_blob.w;
     int h = bottom_blob.h;
     int channels = bottom_blob.c;
@@ -117,70 +109,9 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
     if (top_blob.empty())
         return -100;
 
-    if (use_int8_inference)
-    {
-        Mat bottom_blob_int8;
-        bottom_blob_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
-        if (bottom_blob_int8.empty())
-            return -100;
-
-        // quantize, scale and round to nearest
-        {
-            ncnn::ParamDict pd;
-            pd.set(0, bottom_blob_int8_scale);// scale
-
-            quantize->load_param(pd);
-
-            quantize->forward(bottom_blob, bottom_blob_int8, opt);
-        }
-
-        // num_output
-        #pragma omp parallel for num_threads(opt.num_threads)
-        for (int p=0; p<num_output; p++)
-        {
-            int sum = 0;
-            int* out = top_blob;
-
-            // channels
-            for (int q=0; q<channels; q++)
-            {
-                const signed char* w = (const signed char*)weight_data + size * channels * p + size * q;
-                const signed char* m = bottom_blob_int8.channel(q);
-
-                for (int i = 0; i < size; i++)
-                {
-                    sum += m[i] * w[i];
-                }
-            }
-
-            out[p] = sum;
-        }
-
-        // dequantize, reverse scale inplace
-        {
-            float top_rescale = 1.f / (bottom_blob_int8_scale * weight_data_int8_scale);
-
-            ncnn::ParamDict pd;
-            pd.set(0, top_rescale);// scale
-            pd.set(1, bias_term);// bias_term
-            pd.set(2, num_output);// bias_data_size
-
-            dequantize->load_param(pd);
-
-            ncnn::Mat weights[1];
-            weights[0] = bias_data;
-
-            dequantize->load_model(ModelBinFromMatArray(weights));
-
-            dequantize->forward_inplace(top_blob, opt);
-        }
-
-        return 0;
-    }
-
     // num_output
     #pragma omp parallel for num_threads(opt.num_threads)
-    for (int p=0; p<num_output; p++)
+    for (int p = 0; p < num_output; p++)
     {
         float sum = 0.f;
 
@@ -188,7 +119,7 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
             sum = bias_data[p];
 
         // channels
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             const float* w = (const float*)weight_data + size * channels * p + size * q;
             const float* m = bottom_blob.channel(q);
@@ -198,6 +129,32 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
                 sum += m[i] * w[i];
             }
         }
+        if (activation_type == 1)
+        {
+            sum = std::max(sum, 0.f);
+        }
+        else if (activation_type == 2)
+        {
+            float slope = activation_params[0];
+            sum = sum > 0.f ? sum : sum * slope;
+        }
+        else if (activation_type == 3)
+        {
+            float min = activation_params[0];
+            float max = activation_params[1];
+            if (sum < min)
+                sum = min;
+            if (sum > max)
+                sum = max;
+        }
+        else if (activation_type == 4)
+        {
+            sum = static_cast<float>(1.f / (1.f + exp(-sum)));
+        }
+        else if (activation_type == 5)
+        {
+            sum = static_cast<float>(sum * tanh(log(exp(sum) + 1.f)));
+        }
 
         top_blob[p] = sum;
     }
@@ -205,64 +162,68 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
     return 0;
 }
 
-#if NCNN_VULKAN
-int InnerProduct::upload_model(VkTransfer& cmd)
+int InnerProduct::forward_int8(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
-    cmd.record_upload(weight_data, weight_data_gpu);
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
+    int channels = bottom_blob.c;
+    size_t elemsize = bottom_blob.elemsize;
+    int size = w * h;
 
-    if (bias_term)
+    Mat bottom_blob_tm = bottom_blob;
+    if (elemsize != 1)
     {
-        cmd.record_upload(bias_data, bias_data_gpu);
+        Option opt_g = opt;
+        opt_g.blob_allocator = opt.workspace_allocator;
+
+        quantize_float32_to_int8(bottom_blob, bottom_blob_tm, bottom_blob_int8_scale, opt_g);
+    }
+
+    top_blob.create(num_output, 4u, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
+
+    // num_output
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int p = 0; p < num_output; p++)
+    {
+        float* outptr = top_blob;
+
+        int sum = 0;
+
+        // channels
+        for (int q = 0; q < channels; q++)
+        {
+            const signed char* w = (const signed char*)weight_data + size * channels * p + size * q;
+            const signed char* m = bottom_blob_tm.channel(q);
+
+            for (int i = 0; i < size; i++)
+            {
+                sum += m[i] * w[i];
+            }
+        }
+
+        // dequantize and relu
+        float scale_in;
+        if (weight_data_int8_scales[p] == 0)
+            scale_in = 0;
+        else
+            scale_in = 1.f / (bottom_blob_int8_scale * weight_data_int8_scales[p]);
+
+        float sumfp32 = sum * scale_in;
+
+        if (bias_term)
+            sumfp32 += bias_data[p];
+
+        if (activation_type == 1)
+        {
+            sumfp32 = std::max(sumfp32, 0.f);
+        }
+
+        outptr[p] = sumfp32;
     }
 
     return 0;
 }
-
-int InnerProduct::create_pipeline()
-{
-    pipeline->set_optimal_local_size_xyz(num_output, 1, 1);
-
-    std::vector<vk_specialization_type> specializations(1);
-    specializations[0].i = bias_term;
-
-    pipeline->create("innerproduct", specializations, 4, 10);
-
-    return 0;
-}
-
-int InnerProduct::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
-{
-    top_blob.create(num_output, 4u, opt.blob_vkallocator, opt.staging_vkallocator);
-    if (top_blob.empty())
-        return -100;
-
-//     fprintf(stderr, "InnerProduct::forward %p %p\n", bottom_blob.buffer(), top_blob.buffer());
-
-    std::vector<VkMat> bindings(4);
-    bindings[0] = bottom_blob;
-    bindings[1] = top_blob;
-    bindings[2] = weight_data_gpu;
-    bindings[3] = bias_data_gpu;
-
-    std::vector<vk_constant_type> constants(10);
-    constants[0].i = bottom_blob.dims;
-    constants[1].i = bottom_blob.w;
-    constants[2].i = bottom_blob.h;
-    constants[3].i = bottom_blob.c;
-    constants[4].i = bottom_blob.cstep;
-    constants[5].i = top_blob.dims;
-    constants[6].i = top_blob.w;
-    constants[7].i = top_blob.h;
-    constants[8].i = top_blob.c;
-    constants[9].i = top_blob.cstep;
-
-    // record
-    cmd.record_prepare_compute_barrier(bottom_blob);
-    cmd.record_prepare_compute_barrier(top_blob);
-    cmd.record_pipeline(pipeline, bindings, constants, top_blob);
-
-    return 0;
-}
-#endif // NCNN_VULKAN
 
 } // namespace ncnn

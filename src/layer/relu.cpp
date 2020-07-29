@@ -13,17 +13,15 @@
 // specific language governing permissions and limitations under the License.
 
 #include "relu.h"
+
 #include <algorithm>
 
 namespace ncnn {
-
-DEFINE_LAYER_CREATOR(ReLU)
 
 ReLU::ReLU()
 {
     one_blob_only = true;
     support_inplace = true;
-    support_vulkan = true;
 }
 
 int ReLU::load_param(const ParamDict& pd)
@@ -33,7 +31,7 @@ int ReLU::load_param(const ParamDict& pd)
     return 0;
 }
 
-int ReLU::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
+int ReLU::forward_inplace_int8(Mat& bottom_top_blob, const Option& opt) const
 {
     int w = bottom_top_blob.w;
     int h = bottom_top_blob.h;
@@ -43,11 +41,54 @@ int ReLU::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
     if (slope == 0.f)
     {
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
+        {
+            signed char* ptr = bottom_top_blob.channel(q);
+
+            for (int i = 0; i < size; i++)
+            {
+                if (ptr[i] < 0)
+                    ptr[i] = 0;
+            }
+        }
+    }
+    else
+    {
+        // TODO
+        // #pragma omp parallel for num_threads(opt.num_threads)
+        // for (int q=0; q<channels; q++)
+        // {
+        //     float* ptr = bottom_top_blob.channel(q);
+
+        //     for (int i=0; i<size; i++)
+        //     {
+        //         if (ptr[i] < 0)
+        //             ptr[i] *= slope;
+        //     }
+        // }
+    }
+
+    return 0;
+}
+
+int ReLU::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
+{
+    if (bottom_top_blob.elemsize == 1u)
+        return ReLU::forward_inplace_int8(bottom_top_blob, opt);
+
+    int w = bottom_top_blob.w;
+    int h = bottom_top_blob.h;
+    int channels = bottom_top_blob.c;
+    int size = w * h;
+
+    if (slope == 0.f)
+    {
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int q = 0; q < channels; q++)
         {
             float* ptr = bottom_top_blob.channel(q);
 
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 if (ptr[i] < 0)
                     ptr[i] = 0;
@@ -57,11 +98,11 @@ int ReLU::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
     else
     {
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             float* ptr = bottom_top_blob.channel(q);
 
-            for (int i=0; i<size; i++)
+            for (int i = 0; i < size; i++)
             {
                 if (ptr[i] < 0)
                     ptr[i] *= slope;
@@ -71,40 +112,5 @@ int ReLU::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
     return 0;
 }
-
-#if NCNN_VULKAN
-int ReLU::create_pipeline()
-{
-    pipeline->set_optimal_local_size_xyz();
-
-    std::vector<vk_specialization_type> specializations(1);
-    specializations[0].f = slope;
-
-    pipeline->create("relu", specializations, 1, 5);
-
-    return 0;
-}
-
-int ReLU::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, const Option& opt) const
-{
-//     fprintf(stderr, "ReLU::forward_inplace %p\n", bottom_top_blob.buffer());
-
-    std::vector<VkMat> bindings(1);
-    bindings[0] = bottom_top_blob;
-
-    std::vector<vk_constant_type> constants(5);
-    constants[0].i = bottom_top_blob.dims;
-    constants[1].i = bottom_top_blob.w;
-    constants[2].i = bottom_top_blob.h;
-    constants[3].i = bottom_top_blob.c;
-    constants[4].i = bottom_top_blob.cstep;
-
-    // record
-    cmd.record_prepare_compute_barrier(bottom_top_blob);
-    cmd.record_pipeline(pipeline, bindings, constants, bottom_top_blob);
-
-    return 0;
-}
-#endif // NCNN_VULKAN
 
 } // namespace ncnn

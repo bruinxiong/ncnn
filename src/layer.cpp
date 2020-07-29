@@ -14,65 +14,44 @@
 
 #include "layer.h"
 
-#include <math.h>
-#include <stdio.h>
-#include <string.h>
-#include <algorithm>
 #include "cpu.h"
 
+#include <algorithm>
+#include <math.h>
+#include <string.h>
+
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Woverloaded-virtual"
+#endif
+#include "layer_declaration.h"
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+
 namespace ncnn {
-
-Option::Option()
-{
-    lightmode = true;
-    num_threads = get_cpu_count();
-    blob_allocator = 0;
-    workspace_allocator = 0;
-
-#if NCNN_VULKAN
-    vulkan_compute = true;
-    blob_vkallocator = 0;
-    workspace_vkallocator = 0;
-    staging_vkallocator = 0;
-#endif // NCNN_VULKAN
-}
-
-static Option g_default_option;
-
-const Option& get_default_option()
-{
-    return g_default_option;
-}
-
-int set_default_option(const Option& opt)
-{
-    if (opt.num_threads <= 0)
-    {
-        fprintf(stderr, "invalid option num_threads %d\n", opt.num_threads);
-        return -1;
-    }
-
-    g_default_option = opt;
-
-    return 0;
-}
 
 Layer::Layer()
 {
     one_blob_only = false;
     support_inplace = false;
     support_vulkan = false;
+    support_packing = false;
+
+    support_bf16_storage = false;
+    support_fp16_storage = false;
+    support_image_storage = false;
+
+    use_int8_inference = false;
+    support_weight_fp16_storage = false;
 
 #if NCNN_VULKAN
-    pipeline = 0;
+    vkdev = 0;
 #endif // NCNN_VULKAN
 }
 
 Layer::~Layer()
 {
-#if NCNN_VULKAN
-    delete pipeline;
-#endif // NCNN_VULKAN
 }
 
 int Layer::load_param(const ParamDict& /*pd*/)
@@ -81,6 +60,16 @@ int Layer::load_param(const ParamDict& /*pd*/)
 }
 
 int Layer::load_model(const ModelBin& /*mb*/)
+{
+    return 0;
+}
+
+int Layer::create_pipeline(const Option& /*opt*/)
+{
+    return 0;
+}
+
+int Layer::destroy_pipeline(const Option& /*opt*/)
 {
     return 0;
 }
@@ -124,12 +113,7 @@ int Layer::forward_inplace(Mat& /*bottom_top_blob*/, const Option& /*opt*/) cons
 }
 
 #if NCNN_VULKAN
-int Layer::upload_model(VkTransfer& /*cmd*/)
-{
-    return 0;
-}
-
-int Layer::create_pipeline()
+int Layer::upload_model(VkTransfer& /*cmd*/, const Option& /*opt*/)
 {
     return 0;
 }
@@ -142,12 +126,7 @@ int Layer::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& t
     top_blobs.resize(bottom_blobs.size());
     for (int i = 0; i < (int)top_blobs.size(); i++)
     {
-        top_blobs[i].create_like(bottom_blobs[i], bottom_blobs[i].allocator, bottom_blobs[i].staging_allocator);
-        if (top_blobs[i].empty())
-            return -100;
-
-        cmd.record_prepare_transfer_barrier(bottom_blobs[i]);
-        cmd.record_clone(bottom_blobs[i], top_blobs[i]);
+        cmd.record_clone(bottom_blobs[i], top_blobs[i], opt);
     }
 
     return forward_inplace(top_blobs, cmd, opt);
@@ -158,12 +137,31 @@ int Layer::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, co
     if (!support_inplace)
         return -1;
 
-    top_blob.create_like(bottom_blob, bottom_blob.allocator, bottom_blob.staging_allocator);
-    if (top_blob.empty())
-        return -100;
+    cmd.record_clone(bottom_blob, top_blob, opt);
 
-    cmd.record_prepare_transfer_barrier(bottom_blob);
-    cmd.record_clone(bottom_blob, top_blob);
+    return forward_inplace(top_blob, cmd, opt);
+}
+
+int Layer::forward(const std::vector<VkImageMat>& bottom_blobs, std::vector<VkImageMat>& top_blobs, VkCompute& cmd, const Option& opt) const
+{
+    if (!support_inplace)
+        return -1;
+
+    top_blobs.resize(bottom_blobs.size());
+    for (int i = 0; i < (int)top_blobs.size(); i++)
+    {
+        cmd.record_clone(bottom_blobs[i], top_blobs[i], opt);
+    }
+
+    return forward_inplace(top_blobs, cmd, opt);
+}
+
+int Layer::forward(const VkImageMat& bottom_blob, VkImageMat& top_blob, VkCompute& cmd, const Option& opt) const
+{
+    if (!support_inplace)
+        return -1;
+
+    cmd.record_clone(bottom_blob, top_blob, opt);
 
     return forward_inplace(top_blob, cmd, opt);
 }
@@ -177,21 +175,40 @@ int Layer::forward_inplace(VkMat& /*bottom_top_blob*/, VkCompute& /*cmd*/, const
 {
     return -1;
 }
+
+int Layer::forward_inplace(std::vector<VkImageMat>& /*bottom_top_blobs*/, VkCompute& /*cmd*/, const Option& /*opt*/) const
+{
+    return -1;
+}
+
+int Layer::forward_inplace(VkImageMat& /*bottom_top_blob*/, VkCompute& /*cmd*/, const Option& /*opt*/) const
+{
+    return -1;
+}
 #endif // NCNN_VULKAN
 
-#include "layer_declaration.h"
-
-static const layer_registry_entry layer_registry[] =
-{
+static const layer_registry_entry layer_registry[] = {
 #include "layer_registry.h"
 };
+
+#if NCNN_RUNTIME_CPU && NCNN_AVX2
+static const layer_registry_entry layer_registry_avx2[] = {
+#include "layer_registry_avx2.h"
+};
+#endif // NCNN_RUNTIME_CPU && NCNN_AVX2
+
+#if NCNN_RUNTIME_CPU && NCNN_ARM82
+static const layer_registry_entry layer_registry_arm82[] = {
+#include "layer_registry_arm82.h"
+};
+#endif // NCNN_RUNTIME_CPU && NCNN_ARM82
 
 static const int layer_registry_entry_count = sizeof(layer_registry) / sizeof(layer_registry_entry);
 
 #if NCNN_STRING
 int layer_to_index(const char* type)
 {
-    for (int i=0; i<layer_registry_entry_count; i++)
+    for (int i = 0; i < layer_registry_entry_count; i++)
     {
         if (strcmp(type, layer_registry[i].name) == 0)
             return i;
@@ -215,36 +232,30 @@ Layer* create_layer(int index)
     if (index < 0 || index >= layer_registry_entry_count)
         return 0;
 
-    layer_creator_func layer_creator = layer_registry[index].creator;
+    layer_creator_func layer_creator = 0;
+#if NCNN_RUNTIME_CPU && NCNN_AVX2
+    if (ncnn::cpu_support_x86_avx2())
+    {
+        layer_creator = layer_registry_avx2[index].creator;
+    }
+    else
+#endif // NCNN_RUNTIME_CPU && NCNN_AVX2
+#if NCNN_RUNTIME_CPU && NCNN_ARM82
+        if (ncnn::cpu_support_arm_asimdhp())
+        {
+            layer_creator = layer_registry_arm82[index].creator;
+        }
+        else
+#endif // NCNN_RUNTIME_CPU && NCNN_ARM82
+        {
+            layer_creator = layer_registry[index].creator;
+        }
     if (!layer_creator)
         return 0;
 
-    return layer_creator();
-}
-
-#if NCNN_VULKAN
-#if NCNN_STRING
-Layer* create_layer(const char* type, const VulkanDevice* vkdev)
-{
-    int index = layer_to_index(type);
-    if (index == -1)
-        return 0;
-
-    return create_layer(index, vkdev);
-}
-#endif // NCNN_STRING
-
-Layer* create_layer(int index, const VulkanDevice* vkdev)
-{
-    Layer* layer = create_layer(index);
-    if (!layer)
-        return 0;
-
-    layer->vkdev = vkdev;
-    layer->pipeline = new Pipeline(vkdev);
-
+    Layer* layer = layer_creator();
+    layer->typeindex = index;
     return layer;
 }
-#endif // NCNN_VULKAN
 
 } // namespace ncnn

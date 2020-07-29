@@ -13,11 +13,10 @@
 // specific language governing permissions and limitations under the License.
 
 #include "instancenorm.h"
+
 #include <math.h>
 
 namespace ncnn {
-
-DEFINE_LAYER_CREATOR(InstanceNorm)
 
 InstanceNorm::InstanceNorm()
 {
@@ -55,28 +54,36 @@ int InstanceNorm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
     int size = w * h;
 
     #pragma omp parallel for num_threads(opt.num_threads)
-    for (int q=0; q<channels; q++)
+    for (int q = 0; q < channels; q++)
     {
         float* ptr = bottom_top_blob.channel(q);
 
         // mean and var
         float sum = 0.f;
         float sqsum = 0.f;
-        for (int i=0; i<size; i++)
+        for (int i = 0; i < size; i++)
         {
             sum += ptr[i];
-            sqsum += ptr[i] * ptr[i];
+            //sqsum += ptr[i] * ptr[i];
         }
         float mean = sum / size;
-        float var = sqsum / size - mean * mean;
+        float tmp = 0.f;
+        for (int i = 0; i < size; i++)
+        {
+            tmp = ptr[i] - mean;
+            sqsum += tmp * tmp;
+        }
+        float var = sqsum / size;
+        // the var maybe minus due to accuracy
+        //float var = sqsum / size - mean * mean;
 
         float gamma = gamma_data[q];
         float beta = beta_data[q];
 
-        float a = gamma / (sqrt(var) + eps);
-        float b = - mean * a + beta;
+        float a = static_cast<float>(gamma / (sqrt(var + eps)));
+        float b = -mean * a + beta;
 
-        for (int i=0; i<size; i++)
+        for (int i = 0; i < size; i++)
         {
             ptr[i] = ptr[i] * a + b;
         }

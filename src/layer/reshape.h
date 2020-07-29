@@ -28,7 +28,7 @@ public:
 
     virtual int forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
 
-private:
+public:
     // reshape flag
     // 0 = copy from bottom
     // -1 = remaining
@@ -36,7 +36,10 @@ private:
     int w;
     int h;
     int c;
+
+    // flag permute chw->hwc or hw->wh before and after reshape
     int permute;
+
     int ndim;
 };
 

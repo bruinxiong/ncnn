@@ -16,36 +16,16 @@
 
 #include "layer_type.h"
 
-namespace ncnn {
+#include <algorithm>
 
-DEFINE_LAYER_CREATOR(Convolution)
+namespace ncnn {
 
 Convolution::Convolution()
 {
     one_blob_only = true;
     support_inplace = false;
-    support_vulkan = true;
 
-#if NCNN_VULKAN
-    padding = 0;
-    convolution_fc = 0;
-    convolution_1x1s1d1 = 0;
-#endif // NCNN_VULKAN
-
-    quantize = 0;
-    dequantize = 0;
-}
-
-Convolution::~Convolution()
-{
-#if NCNN_VULKAN
-    delete padding;
-    delete convolution_fc;
-    delete convolution_1x1s1d1;
-#endif // NCNN_VULKAN
-
-    delete quantize;
-    delete dequantize;
+    use_int8_requantize = false;
 }
 
 int Convolution::load_param(const ParamDict& pd)
@@ -57,49 +37,22 @@ int Convolution::load_param(const ParamDict& pd)
     dilation_h = pd.get(12, dilation_w);
     stride_w = pd.get(3, 1);
     stride_h = pd.get(13, stride_w);
-    pad_w = pd.get(4, 0);
-    pad_h = pd.get(14, pad_w);
+    pad_left = pd.get(4, 0);
+    pad_right = pd.get(15, pad_left);
+    pad_top = pd.get(14, pad_left);
+    pad_bottom = pd.get(16, pad_top);
+    pad_value = pd.get(18, 0.f);
     bias_term = pd.get(5, 0);
     weight_data_size = pd.get(6, 0);
     int8_scale_term = pd.get(8, 0);
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
+    impl_type = pd.get(17, 0);
 
-    use_int8_inference = pd.use_int8_inference;
-
-    if (int8_scale_term == 0)
-        use_int8_inference = false;
-
-#if NCNN_VULKAN
-    if (pd.use_vulkan_compute)
+    if (int8_scale_term)
     {
-        padding = ncnn::create_layer(ncnn::LayerType::Padding, vkdev);
-
-        ncnn::ParamDict pd;
-        pd.set(0, pad_h);
-        pd.set(1, pad_h);
-        pd.set(2, pad_w);
-        pd.set(3, pad_w);
-        pd.set(4, 0);
-        pd.set(5, 0.f);
-
-        pd.use_vulkan_compute = 1;
-
-        padding->load_param(pd);
-
-        if (kernel_w == 1 && kernel_h == 1)
-        {
-        convolution_fc = ncnn::create_layer(ncnn::LayerType::InnerProduct, vkdev);
-
-        ncnn::ParamDict pd;
-        pd.set(0, num_output);
-        pd.set(1, bias_term);
-        pd.set(2, weight_data_size);
-
-        pd.use_vulkan_compute = 1;
-
-        convolution_fc->load_param(pd);
-        }
+        use_int8_inference = true;
     }
-#endif // NCNN_VULKAN
 
     return 0;
 }
@@ -119,78 +72,36 @@ int Convolution::load_model(const ModelBin& mb)
 
     if (int8_scale_term)
     {
-        weight_data_int8_scale = mb.load(1, 1)[0];
+        weight_data_int8_scales = mb.load(num_output, 1);
         bottom_blob_int8_scale = mb.load(1, 1)[0];
     }
 
-    bool weight_data_is_int8 = (weight_data.elemsize == (size_t)1u);
-    bool weight_data_is_float32 = (weight_data.elemsize == (size_t)4u);
+    return 0;
+}
 
-    if (weight_data_is_int8 && !use_int8_inference)
+int Convolution::create_pipeline(const Option& opt)
+{
+    // runtime quantize the weight data
+    if (opt.use_int8_inference && weight_data.elemsize == (size_t)4u && int8_scale_term)
     {
-        fprintf(stderr, "quantized int8 weight loaded but use_int8_inference disabled\n");
-        return -1;
-    }
-
-    if (weight_data_is_float32 && use_int8_inference)
-    {
-        // quantize weight to int8
-        Layer* op = ncnn::create_layer(ncnn::LayerType::Quantize);
-
-        ncnn::ParamDict pd;
-        pd.set(0, weight_data_int8_scale);// scale
-
-        op->load_param(pd);
-
-        Mat int8_weight_data;
-        op->forward(weight_data, int8_weight_data);
-
-        delete op;
-
+        Mat int8_weight_data(weight_data_size, (size_t)1u);
         if (int8_weight_data.empty())
             return -100;
 
+        const int weight_data_size_output = weight_data_size / num_output;
+
+        for (int p = 0; p < num_output; p++)
+        {
+            Option opt_q = opt;
+            opt_q.blob_allocator = int8_weight_data.allocator;
+
+            const Mat weight_data_n = weight_data.range(weight_data_size_output * p, weight_data_size_output);
+            Mat int8_weight_data_n = int8_weight_data.range(weight_data_size_output * p, weight_data_size_output);
+            quantize_float32_to_int8(weight_data_n, int8_weight_data_n, weight_data_int8_scales[p], opt_q);
+        }
+
         weight_data = int8_weight_data;
     }
-
-    if (use_int8_inference)
-    {
-        quantize = ncnn::create_layer(ncnn::LayerType::Quantize);
-        {
-            ncnn::ParamDict pd;
-            pd.set(0, bottom_blob_int8_scale);// scale
-
-            quantize->load_param(pd);
-        }
-
-        dequantize = ncnn::create_layer(ncnn::LayerType::Dequantize);
-        {
-            float top_rescale = 1.f / (bottom_blob_int8_scale * weight_data_int8_scale);
-
-            ncnn::ParamDict pd;
-            pd.set(0, top_rescale);// scale
-            pd.set(1, bias_term);// bias_term
-            pd.set(2, num_output);// bias_data_size
-
-            dequantize->load_param(pd);
-
-            ncnn::Mat weights[1];
-            weights[0] = bias_data;
-
-            dequantize->load_model(ModelBinFromMatArray(weights));
-        }
-    }
-
-#if NCNN_VULKAN
-    if (convolution_fc)
-    {
-        ncnn::Mat weights[2];
-        weights[0] = weight_data;
-        weights[1] = bias_data;
-
-        convolution_fc->load_model(ModelBinFromMatArray(weights));
-    }
-#endif // NCNN_VULKAN
 
     return 0;
 }
@@ -200,11 +111,16 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
     // convolv with NxN kernel
     // value = value + bias
 
+    if (opt.use_int8_inference && weight_data.elemsize == (size_t)1u)
+    {
+        return forward_int8(bottom_blob, top_blob, opt);
+    }
+
     // flattened blob, implement as InnerProduct
     if (bottom_blob.dims == 1 && kernel_w == 1 && kernel_h == 1)
     {
         int num_input = weight_data_size / num_output;
-        if (bottom_blob.w == num_input)
+        if (bottom_blob.w * bottom_blob.elempack == num_input)
         {
             // call InnerProduct
             ncnn::Layer* op = ncnn::create_layer(ncnn::LayerType::InnerProduct);
@@ -215,8 +131,8 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
             pd.set(1, bias_term);
             pd.set(2, weight_data_size);
             pd.set(8, int8_scale_term);
-
-            pd.use_int8_inference = use_int8_inference;
+            pd.set(9, activation_type);
+            pd.set(10, activation_params);
 
             op->load_param(pd);
 
@@ -227,14 +143,18 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
 
             if (int8_scale_term)
             {
-                weights[2] = Mat(1, (size_t)4u, (void*)&weight_data_int8_scale);
+                weights[2] = weight_data_int8_scales;
                 weights[3] = Mat(1, (size_t)4u, (void*)&bottom_blob_int8_scale);
             }
 
             op->load_model(ModelBinFromMatArray(weights));
 
+            op->create_pipeline(opt);
+
             // forward
             op->forward(bottom_blob, top_blob, opt);
+
+            op->destroy_pipeline(opt);
 
             delete op;
 
@@ -247,61 +167,21 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
     int channels = bottom_blob.c;
     size_t elemsize = bottom_blob.elemsize;
 
-//     fprintf(stderr, "Convolution input %d x %d  pad = %d %d  ksize=%d %d  stride=%d %d\n", w, h, pad_w, pad_h, kernel_w, kernel_h, stride_w, stride_h);
+    //     NCNN_LOGE("Convolution input %d x %d  pad = %d %d  ksize=%d %d  stride=%d %d", w, h, pad_w, pad_h, kernel_w, kernel_h, stride_w, stride_h);
 
     const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
     const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
 
-    Mat bottom_blob_unbordered = bottom_blob;
-    if (use_int8_inference && elemsize != 1)
-    {
-        Mat bottom_blob_int8;
-        bottom_blob_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
-        if (bottom_blob_int8.empty())
-            return -100;
+    Mat bottom_blob_bordered;
+    make_padding(bottom_blob, bottom_blob_bordered, opt);
+    if (bottom_blob_bordered.empty())
+        return -100;
 
-        // quantize, scale and round to nearest
-        {
-            ncnn::Option opt_g = opt;
-            opt_g.blob_allocator = bottom_blob_int8.allocator;
-
-            quantize->forward(bottom_blob, bottom_blob_int8, opt_g);
-        }
-
-        bottom_blob_unbordered = bottom_blob_int8;
-    }
-
-    Mat bottom_blob_bordered = bottom_blob_unbordered;
-    if (pad_w > 0 || pad_h > 0)
-    {
-        copy_make_border(bottom_blob_unbordered, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
-        if (bottom_blob_bordered.empty())
-            return -100;
-
-        w = bottom_blob_bordered.w;
-        h = bottom_blob_bordered.h;
-    }
-    else if (pad_w == -233 && pad_h == -233)
-    {
-        int wpad = kernel_extent_w + (w - 1) / stride_w * stride_w - w;
-        int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
-        if (wpad > 0 || hpad > 0)
-        {
-            copy_make_border(bottom_blob_unbordered, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
-            if (bottom_blob_bordered.empty())
-                return -100;
-        }
-
-        w = bottom_blob_bordered.w;
-        h = bottom_blob_bordered.h;
-    }
+    w = bottom_blob_bordered.w;
+    h = bottom_blob_bordered.h;
 
     int outw = (w - kernel_extent_w) / stride_w + 1;
     int outh = (h - kernel_extent_h) / stride_h + 1;
-
-    top_blob.create(outw, outh, num_output, elemsize, opt.blob_allocator);
-    if (top_blob.empty())
-        return -100;
 
     const int maxk = kernel_w * kernel_h;
 
@@ -324,59 +204,14 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
         }
     }
 
-    if (use_int8_inference)
-    {
-        // num_output
-        #pragma omp parallel for num_threads(opt.num_threads)
-        for (int p=0; p<num_output; p++)
-        {
-            int* outptr = top_blob.channel(p);
-
-            for (int i = 0; i < outh; i++)
-            {
-                for (int j = 0; j < outw; j++)
-                {
-                    int sum = 0;
-
-                    const signed char* kptr = (const signed char*)weight_data + maxk * channels * p;
-
-                    // channels
-                    for (int q=0; q<channels; q++)
-                    {
-                        const Mat m = bottom_blob_bordered.channel(q);
-                        const signed char* sptr = m.row<signed char>(i*stride_h) + j*stride_w;
-
-                        for (int k = 0; k < maxk; k++)
-                        {
-                            int val = sptr[ space_ofs[k] ];
-                            int w = kptr[k];
-                            sum += val * w;
-                        }
-
-                        kptr += maxk;
-                    }
-
-                    outptr[j] = sum;
-                }
-
-                outptr += outw;
-            }
-        }
-
-        // dequantize, reverse scale inplace
-        {
-            ncnn::Option opt_g = opt;
-            opt_g.blob_allocator = top_blob.allocator;
-
-            dequantize->forward_inplace(top_blob, opt_g);
-        }
-
-        return 0;
-    }
+    // float32
+    top_blob.create(outw, outh, num_output, elemsize, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
 
     // num_output
     #pragma omp parallel for num_threads(opt.num_threads)
-    for (int p=0; p<num_output; p++)
+    for (int p = 0; p < num_output; p++)
     {
         float* outptr = top_blob.channel(p);
 
@@ -392,19 +227,54 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
                 const float* kptr = (const float*)weight_data + maxk * channels * p;
 
                 // channels
-                for (int q=0; q<channels; q++)
+                for (int q = 0; q < channels; q++)
                 {
                     const Mat m = bottom_blob_bordered.channel(q);
-                    const float* sptr = m.row(i*stride_h) + j*stride_w;
+                    const float* sptr = m.row(i * stride_h) + j * stride_w;
 
                     for (int k = 0; k < maxk; k++) // 29.23
                     {
-                        float val = sptr[ space_ofs[k] ]; // 20.72
+                        float val = sptr[space_ofs[k]]; // 20.72
                         float w = kptr[k];
                         sum += val * w; // 41.45
                     }
 
                     kptr += maxk;
+                }
+
+                if (activation_type == 1)
+                {
+                    sum = std::max(sum, 0.f);
+                }
+                else if (activation_type == 2)
+                {
+                    float slope = activation_params[0];
+                    sum = sum > 0.f ? sum : sum * slope;
+                }
+                else if (activation_type == 3)
+                {
+                    float min = activation_params[0];
+                    float max = activation_params[1];
+                    if (sum < min)
+                        sum = min;
+                    if (sum > max)
+                        sum = max;
+                }
+                else if (activation_type == 4)
+                {
+                    sum = static_cast<float>(1.f / (1.f + exp(-sum)));
+                }
+                else if (activation_type == 5)
+                {
+                    const float MISH_THRESHOLD = 20;
+                    float x = sum, y;
+                    if (x > MISH_THRESHOLD)
+                        y = x;
+                    else if (x < -MISH_THRESHOLD)
+                        y = expf(x);
+                    else
+                        y = logf(expf(x) + 1);
+                    sum = static_cast<float>(x * tanh(y));
                 }
 
                 outptr[j] = sum;
@@ -417,150 +287,197 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
     return 0;
 }
 
-#if NCNN_VULKAN
-int Convolution::upload_model(VkTransfer& cmd)
+void Convolution::make_padding(const Mat& bottom_blob, Mat& bottom_blob_bordered, const Option& opt) const
 {
-    cmd.record_upload(weight_data, weight_data_gpu);
-
-    if (bias_term)
-    {
-        cmd.record_upload(bias_data, bias_data_gpu);
-    }
-
-    if (kernel_w == 1 && kernel_h == 1)
-    {
-        convolution_fc->upload_model(cmd);
-    }
-
-    return 0;
-}
-
-int Convolution::create_pipeline()
-{
-    pipeline->set_optimal_local_size_xyz(32, 32, std::max(1, num_output / 8));
-
-    std::vector<vk_specialization_type> specializations(7);
-    specializations[0].i = kernel_w;
-    specializations[1].i = kernel_h;
-    specializations[2].i = dilation_w;
-    specializations[3].i = dilation_h;
-    specializations[4].i = stride_w;
-    specializations[5].i = stride_h;
-    specializations[6].i = bias_term;
-
-    pipeline->create("convolution", specializations, 4, 10);
-
-    padding->create_pipeline();
-
-    if (kernel_w == 1 && kernel_h == 1)
-    {
-        convolution_fc->create_pipeline();
-    }
-
-    if (kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
-    {
-        convolution_1x1s1d1 = new Pipeline(vkdev);
-
-        convolution_1x1s1d1->set_optimal_local_size_xyz(-1, 1, std::max(1, num_output / 8));
-
-        std::vector<vk_specialization_type> specializations(1);
-        specializations[0].i = bias_term;
-
-        convolution_1x1s1d1->create("convolution_1x1s1d1", specializations, 4, 8);
-    }
-
-    return 0;
-}
-
-int Convolution::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
-{
-    // flattened blob, implement as InnerProduct
-    if (bottom_blob.dims == 1 && kernel_w == 1 && kernel_h == 1)
-    {
-        int num_input = weight_data_size / num_output;
-        if (bottom_blob.w == num_input)
-        {
-            // call InnerProduct
-            return convolution_fc->forward(bottom_blob, top_blob, cmd, opt);
-        }
-    }
-
     int w = bottom_blob.w;
     int h = bottom_blob.h;
-    int channels = bottom_blob.c;
 
     const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
     const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
 
-    VkMat bottom_blob_bordered = bottom_blob;
-    if (pad_w > 0 || pad_h > 0)
+    bottom_blob_bordered = bottom_blob;
+    if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0)
     {
-        ncnn::Option opt_pad = opt;
-        opt_pad.blob_vkallocator = opt.workspace_vkallocator;
-
-        padding->forward(bottom_blob, bottom_blob_bordered, cmd, opt_pad);
-
-        w = bottom_blob_bordered.w;
-        h = bottom_blob_bordered.h;
+        Option opt_b = opt;
+        opt_b.blob_allocator = opt.workspace_allocator;
+        copy_make_border(bottom_blob, bottom_blob_bordered, pad_top, pad_bottom, pad_left, pad_right, BORDER_CONSTANT, pad_value, opt_b);
     }
+    else if (pad_left == -233 && pad_right == -233 && pad_top == -233 && pad_bottom == -233)
+    {
+        // tensorflow padding=SAME or onnx padding=SAME_UPPER
+        int wpad = kernel_extent_w + (w - 1) / stride_w * stride_w - w;
+        int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
+        if (wpad > 0 || hpad > 0)
+        {
+            Option opt_b = opt;
+            opt_b.blob_allocator = opt.workspace_allocator;
+            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, pad_value, opt_b);
+        }
+    }
+    else if (pad_left == -234 && pad_right == -234 && pad_top == -234 && pad_bottom == -234)
+    {
+        // onnx padding=SAME_LOWER
+        int wpad = kernel_extent_w + (w - 1) / stride_w * stride_w - w;
+        int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
+        if (wpad > 0 || hpad > 0)
+        {
+            Option opt_b = opt;
+            opt_b.blob_allocator = opt.workspace_allocator;
+            copy_make_border(bottom_blob, bottom_blob_bordered, hpad - hpad / 2, hpad / 2, wpad - wpad / 2, wpad / 2, BORDER_CONSTANT, pad_value, opt_b);
+        }
+    }
+}
+
+static inline signed char float2int8(float v)
+{
+    int int32 = static_cast<int>(round(v));
+    if (int32 > 127) return 127;
+    if (int32 < -127) return -127;
+    return (signed char)int32;
+}
+
+int Convolution::forward_int8(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+{
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
+    int channels = bottom_blob.c;
+    size_t elemsize = bottom_blob.elemsize;
+
+    //     NCNN_LOGE("Convolution input %d x %d  ksize=%d %d  stride=%d %d", w, h, kernel_w, kernel_h, stride_w, stride_h);
+
+    const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+    const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+
+    Mat bottom_blob_unbordered = bottom_blob;
+    if (elemsize != 1)
+    {
+        Option opt_g = opt;
+        opt_g.blob_allocator = opt.workspace_allocator;
+
+        quantize_float32_to_int8(bottom_blob, bottom_blob_unbordered, bottom_blob_int8_scale, opt_g);
+    }
+
+    Mat bottom_blob_bordered;
+    make_padding(bottom_blob_unbordered, bottom_blob_bordered, opt);
+    if (bottom_blob_bordered.empty())
+        return -100;
+
+    w = bottom_blob_bordered.w;
+    h = bottom_blob_bordered.h;
 
     int outw = (w - kernel_extent_w) / stride_w + 1;
     int outh = (h - kernel_extent_h) / stride_h + 1;
 
-    top_blob.create(outw, outh, num_output, 4u, opt.blob_vkallocator, opt.staging_vkallocator);
+    const int maxk = kernel_w * kernel_h;
+
+    // kernel offsets
+    std::vector<int> _space_ofs(maxk);
+    int* space_ofs = &_space_ofs[0];
+    {
+        int p1 = 0;
+        int p2 = 0;
+        int gap = w * dilation_h - kernel_w * dilation_w;
+        for (int i = 0; i < kernel_h; i++)
+        {
+            for (int j = 0; j < kernel_w; j++)
+            {
+                space_ofs[p1] = p2;
+                p1++;
+                p2 += dilation_w;
+            }
+            p2 += gap;
+        }
+    }
+
+    // int8
+    size_t out_elemsize = use_int8_requantize ? 1u : 4u;
+
+    top_blob.create(outw, outh, num_output, out_elemsize, opt.blob_allocator);
     if (top_blob.empty())
         return -100;
 
-//     fprintf(stderr, "Convolution::forward %p %p\n", bottom_blob_bordered.buffer(), top_blob.buffer());
-
-    std::vector<VkMat> bindings(4);
-    bindings[0] = bottom_blob_bordered;
-    bindings[1] = top_blob;
-    bindings[2] = weight_data_gpu;
-    bindings[3] = bias_term ? bias_data_gpu : weight_data_gpu;// TODO use dummy buffer
-
-    // record
-    cmd.record_prepare_compute_barrier(bottom_blob_bordered);
-    cmd.record_prepare_compute_barrier(top_blob);
-
-    if (kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
+    // num_output
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int p = 0; p < num_output; p++)
     {
-        std::vector<vk_constant_type> constants(8);
-        constants[0].i = bottom_blob_bordered.dims;
-        constants[1].i = bottom_blob_bordered.cstep / 4;
-        constants[2].i = bottom_blob_bordered.c;
-        constants[3].i = bottom_blob_bordered.cstep / 4;
-        constants[4].i = top_blob.dims;
-        constants[5].i = top_blob.cstep / 4;
-        constants[6].i = top_blob.c;
-        constants[7].i = top_blob.cstep / 4;
+        signed char* outptr = top_blob.channel(p);
 
-        VkMat dispatcher;
-        dispatcher.w = top_blob.cstep / 4;
-        dispatcher.h = 1;
-        dispatcher.c = top_blob.c;
+        for (int i = 0; i < outh; i++)
+        {
+            for (int j = 0; j < outw; j++)
+            {
+                int sum = 0;
 
-        cmd.record_pipeline(convolution_1x1s1d1, bindings, constants, dispatcher);
-    }
-    else
-    {
-        std::vector<vk_constant_type> constants(10);
-        constants[0].i = bottom_blob_bordered.dims;
-        constants[1].i = bottom_blob_bordered.w;
-        constants[2].i = bottom_blob_bordered.h;
-        constants[3].i = bottom_blob_bordered.c;
-        constants[4].i = bottom_blob_bordered.cstep;
-        constants[5].i = top_blob.dims;
-        constants[6].i = top_blob.w;
-        constants[7].i = top_blob.h;
-        constants[8].i = top_blob.c;
-        constants[9].i = top_blob.cstep;
+                const signed char* kptr = (const signed char*)weight_data + maxk * channels * p;
 
-        cmd.record_pipeline(pipeline, bindings, constants, top_blob);
+                // channels
+                for (int q = 0; q < channels; q++)
+                {
+                    const Mat m = bottom_blob_bordered.channel(q);
+                    const signed char* sptr = m.row<signed char>(i * stride_h) + j * stride_w;
+
+                    for (int k = 0; k < maxk; k++)
+                    {
+                        int val = sptr[space_ofs[k]];
+                        int w = kptr[k];
+                        sum += val * w;
+                    }
+
+                    kptr += maxk;
+                }
+
+                if (use_int8_requantize)
+                {
+                    // requantize and relu
+                    float scale_in;
+                    if (weight_data_int8_scales[p] == 0)
+                        scale_in = 0;
+                    else
+                        scale_in = 1.f / (bottom_blob_int8_scale * weight_data_int8_scales[p]);
+
+                    float sumfp32 = sum * scale_in;
+
+                    if (bias_term)
+                        sumfp32 += bias_data[p];
+
+                    float scale_out = top_blob_int8_scale; //FIXME load param
+
+                    signed char sums8 = float2int8(sumfp32 * scale_out);
+
+                    if (activation_type == 1)
+                    {
+                        sums8 = std::max(sums8, (signed char)0);
+                    }
+
+                    outptr[0] = sums8;
+                    outptr += 1;
+                }
+                else
+                {
+                    // dequantize and relu
+                    float scale_in;
+                    if (weight_data_int8_scales[p] == 0)
+                        scale_in = 0;
+                    else
+                        scale_in = 1.f / (bottom_blob_int8_scale * weight_data_int8_scales[p]);
+
+                    float sumfp32 = sum * scale_in;
+                    if (bias_term)
+                        sumfp32 += bias_data[p];
+
+                    if (activation_type == 1)
+                    {
+                        sumfp32 = std::max(sumfp32, 0.f);
+                    }
+
+                    ((float*)outptr)[0] = sumfp32;
+                    outptr += 4;
+                }
+            }
+        }
     }
 
     return 0;
 }
-#endif // NCNN_VULKAN
 
 } // namespace ncnn

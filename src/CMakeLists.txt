@@ -3,121 +3,64 @@
 
 configure_file(platform.h.in ${CMAKE_CURRENT_BINARY_DIR}/platform.h)
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR})
-include_directories(${CMAKE_CURRENT_BINARY_DIR})
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/layer)
-
-if(NCNN_VULKAN)
+if(NCNN_VULKAN AND NOT NCNN_VULKAN_ONLINE_SPIRV)
     find_program(GLSLANGVALIDATOR_EXECUTABLE NAMES glslangValidator PATHS $ENV{VULKAN_SDK}/bin NO_CMAKE_FIND_ROOT_PATH)
     message(STATUS "Found glslangValidator: ${GLSLANGVALIDATOR_EXECUTABLE}")
-    include_directories(${Vulkan_INCLUDE_DIR})
 endif()
+
+# Add source file to list, and add to special visual folder
+function(ncnn_src_group ncnn_src_string folder)
+    string(REPLACE " " ";" _ncnn_src_list ${ncnn_src_string})
+
+    string(REGEX REPLACE "/" "\\\\" _target_folder "${folder}")
+
+    foreach(_file IN LISTS ${_ncnn_src_list})
+        source_group ("${_target_folder}" FILES "${_file}")
+    endforeach ()
+endfunction()
 
 set(ncnn_SRCS
     allocator.cpp
+    benchmark.cpp
     blob.cpp
+    c_api.cpp
     command.cpp
     cpu.cpp
+    datareader.cpp
     gpu.cpp
     layer.cpp
     mat.cpp
     mat_pixel.cpp
     mat_pixel_resize.cpp
+    mat_pixel_rotate.cpp
     modelbin.cpp
     net.cpp
     opencv.cpp
+    option.cpp
     paramdict.cpp
     pipeline.cpp
-    benchmark.cpp
+    pipelinecache.cpp
 )
 
-macro(ncnn_add_layer class)
-    string(TOLOWER ${class} name)
+if(ANDROID)
+    list(APPEND ncnn_SRCS mat_pixel_android.cpp)
+endif()
 
-    # WITH_LAYER_xxx option
-    if(${ARGC} EQUAL 2)
-        option(WITH_LAYER_${name} "build with layer ${name}" ${ARGV1})
-    else()
-        option(WITH_LAYER_${name} "build with layer ${name}" ON)
-    endif()
+ncnn_src_group(ncnn_SRCS "sources")
 
-    if(NCNN_CMAKE_VERBOSE)
-        message(STATUS "WITH_LAYER_${name} = ${WITH_LAYER_${name}}")
-    endif()
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/layer/${NCNN_TARGET_ARCH}")
 
-    if(WITH_LAYER_${name})
-        list(APPEND ncnn_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/layer/${name}.cpp")
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ncnn_generate_shader_spv_header.cmake)
 
-        # look for arch specific implementation and append source
-        # optimized implementation for armv7, aarch64 or x86
-        if((IOS AND CMAKE_OSX_ARCHITECTURES MATCHES "arm")
-            OR (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64)"))
-            set(arch arm)
-        else()
-            set(arch x86)
-        endif()
-        set(LAYER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/layer/${arch}/${name}_${arch}.cpp)
-        if(EXISTS ${LAYER_SRC})
-            set(WITH_LAYER_${name}_${arch} 1)
-            list(APPEND ncnn_SRCS ${LAYER_SRC})
-            if(NCNN_CMAKE_VERBOSE)
-                message(STATUS "Adding layer: ${LAYER_SRC}")
-            endif()
-        endif()
-    endif()
-
-    # generate layer_declaration and layer_registry file
-    if(WITH_LAYER_${name})
-        if(WITH_LAYER_${name}_${arch})
-            string(APPEND layer_declaration
-                "extern Layer* ${class}_${arch}_layer_creator();\n")
-            string(APPEND layer_registry
-                "#if NCNN_STRING\n{\"${class}\",${class}_${arch}_layer_creator},\n#else\n{${class}_${arch}_layer_creator},\n#endif\n")
-        else()
-            string(APPEND layer_declaration
-                "extern Layer* ${class}_layer_creator();\n")
-            string(APPEND layer_registry
-                "#if NCNN_STRING\n{\"${class}\",${class}_layer_creator},\n#else\n{${class}_layer_creator},\n#endif\n")
-        endif()
-    else()
-        string(APPEND layer_registry "#if NCNN_STRING\n{\"${class}\",0},\n#else\n{0},\n#endif\n")
-    endif()
-
-    if(WITH_LAYER_${name} AND NCNN_VULKAN)
-        file(GLOB_RECURSE SHADER_SRCS "layer/shader/${name}.comp")
-        file(GLOB_RECURSE SHADER_SUBSRCS "layer/shader/${name}_*.comp")
-        list(APPEND SHADER_SRCS ${SHADER_SUBSRCS})
-        foreach(SHADER_SRC ${SHADER_SRCS})
-            get_filename_component(SHADER_SRC_NAME ${SHADER_SRC} NAME)
-            get_filename_component(SHADER_SRC_NAME_WE ${SHADER_SRC} NAME_WE)
-
-            set(SHADER_SPV_HEX_FILE ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}.spv.hex.h)
-            add_custom_command(
-                OUTPUT ${SHADER_SPV_HEX_FILE}
-                COMMAND ${GLSLANGVALIDATOR_EXECUTABLE}
-                ARGS -V -s -e ${SHADER_SRC_NAME_WE} --source-entrypoint main -x -o ${SHADER_SPV_HEX_FILE} ${SHADER_SRC}
-                DEPENDS ${SHADER_SRC}
-                COMMENT "Building SPIR-V module ${SHADER_SRC_NAME_WE}.spv"
-                VERBATIM
-            )
-            set_source_files_properties(${SHADER_SPV_HEX_FILE} PROPERTIES GENERATED TRUE)
-
-            string(APPEND layer_shader_spv_data "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = {\n#include \"${SHADER_SRC_NAME_WE}.spv.hex.h\"\n};\n")
-            string(APPEND layer_shader_registry "{\"${SHADER_SRC_NAME_WE}\",${SHADER_SRC_NAME_WE}_spv_data,sizeof(${SHADER_SRC_NAME_WE}_spv_data)},\n")
-
-            list(APPEND SHADER_SPV_HEX_FILES ${SHADER_SPV_HEX_FILE})
-        endforeach()
-    endif()
-
-    # generate layer_type_enum file
-    string(APPEND layer_type_enum "${class} = ${__LAYER_TYPE_ENUM_INDEX},\n")
-    math(EXPR __LAYER_TYPE_ENUM_INDEX "${__LAYER_TYPE_ENUM_INDEX}+1")
-endmacro()
+# ncnn macro
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ncnn_add_shader.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ncnn_add_layer.cmake)
 
 # look for vulkan compute shader and compile
-set(SHADER_SPV_HEX_FILES)
+set(NCNN_SHADER_SPV_HEX_FILES)
 
 set(__LAYER_TYPE_ENUM_INDEX 0)
+set(__LAYER_SHADER_TYPE_ENUM_INDEX 0)
 
 # layer implementation
 ncnn_add_layer(AbsVal)
@@ -159,7 +102,7 @@ ncnn_add_layer(TanH)
 ncnn_add_layer(Threshold)
 ncnn_add_layer(Tile OFF)
 ncnn_add_layer(RNN OFF)
-ncnn_add_layer(LSTM OFF)
+ncnn_add_layer(LSTM)
 ncnn_add_layer(BinaryOp)
 ncnn_add_layer(UnaryOp)
 ncnn_add_layer(ConvolutionDepthWise)
@@ -181,51 +124,185 @@ ncnn_add_layer(Quantize)
 ncnn_add_layer(Dequantize)
 ncnn_add_layer(Yolov3DetectionOutput)
 ncnn_add_layer(PSROIPooling)
-ncnn_add_layer(ROIAlign OFF)
+ncnn_add_layer(ROIAlign)
 ncnn_add_layer(Packing)
+ncnn_add_layer(Requantize)
+ncnn_add_layer(Cast)
+ncnn_add_layer(HardSigmoid)
+ncnn_add_layer(SELU)
+ncnn_add_layer(HardSwish)
+ncnn_add_layer(Noop)
+ncnn_add_layer(PixelShuffle)
+ncnn_add_layer(DeepCopy)
+ncnn_add_layer(Mish)
+ncnn_add_layer(StatisticsPooling)
+ncnn_add_layer(Swish)
 
-# message("SHADER_SPV_HEX_FILES = ${SHADER_SPV_HEX_FILES}")
-add_custom_target(generate-spirv DEPENDS ${SHADER_SPV_HEX_FILES})
+if(NCNN_VULKAN)
+    ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/convert_ycbcr.comp)
+endif()
+
+add_custom_target(ncnn-generate-spirv DEPENDS ${NCNN_SHADER_SPV_HEX_FILES})
 
 # create new
 configure_file(layer_declaration.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_declaration.h)
 configure_file(layer_registry.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_registry.h)
+configure_file(layer_registry_avx2.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_registry_avx2.h)
+configure_file(layer_registry_arm82.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_registry_arm82.h)
 configure_file(layer_type_enum.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_type_enum.h)
 configure_file(layer_shader_registry.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_shader_registry.h)
 configure_file(layer_shader_spv_data.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_shader_spv_data.h)
+configure_file(layer_shader_type_enum.h.in ${CMAKE_CURRENT_BINARY_DIR}/layer_shader_type_enum.h)
 
 add_library(ncnn STATIC ${ncnn_SRCS})
 
-add_dependencies(ncnn generate-spirv)
+target_include_directories(ncnn
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<INSTALL_INTERFACE:include/ncnn>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
+    PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/layer>)
 
-if(NCNN_OPENMP AND OpenMP_CXX_FOUND)
+if(NCNN_OPENMP)
+    find_package(OpenMP)
+    if(NOT TARGET OpenMP::OpenMP_CXX AND (OpenMP_CXX_FOUND OR OPENMP_FOUND))
+        target_compile_options(ncnn PRIVATE ${OpenMP_CXX_FLAGS})
+    endif()
+endif()
+
+if(NCNN_VULKAN)
+    find_package(Vulkan REQUIRED)
+    target_link_libraries(ncnn PUBLIC Vulkan::Vulkan)
+
+    if(NCNN_VULKAN_ONLINE_SPIRV)
+        target_include_directories(ncnn PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../>)
+        target_link_libraries(ncnn PRIVATE glslang SPIRV)
+    endif()
+endif()
+
+if(ANDROID_NDK)
+    target_link_libraries(ncnn PUBLIC android log)
+endif()
+
+if(WIN32)
+    target_compile_definitions(ncnn
+        PUBLIC NOMINMAX)
+endif()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC"
+    OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_SIMULATE_ID MATCHES "MSVC"))
+    target_compile_definitions(ncnn
+        PRIVATE _SCL_SECURE_NO_WARNINGS _CRT_SECURE_NO_DEPRECATE)
+else()
+    target_compile_options(ncnn
+        PRIVATE -Wall -Wextra -Wno-unused-function)
+    if(NOT NCNN_DISABLE_PIC)
+        set_target_properties(ncnn
+            PROPERTIES
+                POSITION_INDEPENDENT_CODE ON
+                INTERFACE_POSITION_INDEPENDENT_CODE ON)
+    endif()
+
+    if(CMAKE_BUILD_TYPE MATCHES "(Release|RELEASE|release)")
+        if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+            target_compile_options(ncnn PRIVATE -Ofast)
+        endif()
+
+        target_compile_options(ncnn PRIVATE -ffast-math)
+    endif()
+
+    if(PI3)
+        target_compile_options(ncnn
+            PRIVATE -march=native -mfpu=neon -mfloat-abi=hard)
+        target_compile_definitions(ncnn
+            PRIVATE __ARM_NEON __ANDROID__)
+    endif()
+    # target_compile_options(ncnn PRIVATE -march=native)
+    # set_target_properties(ncnn PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
+    target_compile_options(ncnn PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+endif()
+
+if(NCNN_DISABLE_RTTI)
+    target_compile_options(ncnn PUBLIC -fno-rtti)
+endif()
+
+if(NCNN_DISABLE_EXCEPTION)
+    target_compile_options(ncnn PUBLIC -fno-exceptions)
+endif()
+
+if(ANDROID OR IOS)
+    # disable shared library on android and xcode ios
+    set_property(GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS FALSE)
+endif()
+
+if(NOT NCNN_RUNTIME_CPU AND NCNN_AVX2 AND NCNN_TARGET_ARCH STREQUAL "x86")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC" OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_SIMULATE_ID MATCHES "MSVC"))
+        target_compile_options(ncnn PRIVATE /arch:AVX2 /DAVX2 /fp:strict)
+    else()
+        target_compile_options(ncnn PRIVATE -mfma -mf16c -mavx2)
+    endif()
+endif()
+
+if(NOT NCNN_RUNTIME_CPU AND NCNN_ARM82 AND ((IOS AND CMAKE_OSX_ARCHITECTURES MATCHES "arm64") OR (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64)")))
+    target_compile_options(ncnn PRIVATE -march=armv8.2-a+fp16)
+endif()
+
+add_dependencies(ncnn ncnn-generate-spirv)
+
+if(NCNN_OPENMP AND (OpenMP_CXX_FOUND OR OPENMP_FOUND))
     if(NCNN_CMAKE_VERBOSE)
         message("Building with OpenMP")
     endif()
-    target_link_libraries(ncnn PUBLIC OpenMP::OpenMP_CXX)
+
+    if(ANDROID_NDK_MAJOR AND (ANDROID_NDK_MAJOR GREATER 20))
+        target_compile_options(ncnn PRIVATE -fopenmp)
+        target_link_libraries(ncnn PUBLIC -fopenmp -static-openmp)
+    elseif(OpenMP_CXX_FOUND)
+        target_link_libraries(ncnn PUBLIC OpenMP::OpenMP_CXX)
+    else()
+        target_link_libraries(ncnn PRIVATE "${OpenMP_CXX_FLAGS}")
+    endif()
 endif()
 
-if(COVERAGE)
-    target_compile_options(ncnn PRIVATE --coverage)
+if(NCNN_INSTALL_SDK)
+    install(TARGETS ncnn EXPORT ncnn ARCHIVE DESTINATION lib)
+    install(FILES
+        allocator.h
+        benchmark.h
+        blob.h
+        c_api.h
+        command.h
+        cpu.h
+        datareader.h
+        gpu.h
+        layer.h
+        layer_shader_type.h
+        layer_type.h
+        mat.h
+        modelbin.h
+        net.h
+        opencv.h
+        option.h
+        paramdict.h
+        pipeline.h
+        pipelinecache.h
+        ${CMAKE_CURRENT_BINARY_DIR}/layer_shader_type_enum.h
+        ${CMAKE_CURRENT_BINARY_DIR}/layer_type_enum.h
+        ${CMAKE_CURRENT_BINARY_DIR}/platform.h
+        DESTINATION include/ncnn
+    )
+    install(EXPORT ncnn
+        DESTINATION lib/cmake/ncnn)
+    configure_file(${CMAKE_CURRENT_LIST_DIR}/../cmake/ncnnConfig.cmake.in
+        ncnnConfig.cmake
+        @ONLY)
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/ncnnConfig.cmake
+        DESTINATION lib/cmake/ncnn)
 endif()
 
-install(TARGETS ncnn ARCHIVE DESTINATION lib)
-install(FILES
-    allocator.h
-    blob.h
-    command.h
-    cpu.h
-    gpu.h
-    layer.h
-    layer_type.h
-    mat.h
-    modelbin.h
-    net.h
-    opencv.h
-    paramdict.h
-    pipeline.h
-    benchmark.h
-    ${CMAKE_CURRENT_BINARY_DIR}/layer_type_enum.h
-    ${CMAKE_CURRENT_BINARY_DIR}/platform.h
-    DESTINATION include
-)
+# add ncnn and generate-spirv to a virtual project group
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+set_property(TARGET ncnn PROPERTY FOLDER "libncnn")
+set_property(TARGET ncnn-generate-spirv PROPERTY FOLDER "libncnn")
